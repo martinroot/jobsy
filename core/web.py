@@ -1,0 +1,1342 @@
+"""Loopback-only visual sandbox backed by the existing SQLite agent state."""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import time
+from dataclasses import dataclass, field
+from decimal import Decimal
+from http.cookies import SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.resources import files
+from pathlib import Path, PurePosixPath
+from threading import Event, Lock, Thread
+from typing import Any, Callable
+from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
+
+from .agent import Agent, SYSTEM_PROMPT
+from .approvals import ApprovalRegistry
+from .auth import create_session_token, verify_password, verify_session_token
+from .config import Config, load_config
+from .context import ContextBuilder
+from .delegation import DelegationManager
+from .provider import OpenAICompatibleProvider
+from .runtime import RuntimeLease
+from .runtime_context import extract_runtime_context
+from .state import StateStore, goal_lesson_fingerprint
+from .tools import ToolRegistry, _resolve
+from .workspace import resolve_session_workspace
+from .goals import validate_checks, verify
+from .worker import load_workers
+
+ProviderFactory = Callable[[str, str, str], Any]
+_REFLECTION_VOLATILE_KEYS = {"timestamp", "created_at", "updated_at", "request_id", "event_id", "nonce"}
+
+
+def _normalize_reflection_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _normalize_reflection_value(item)
+            for key, item in sorted(value.items())
+            if str(key).lower() not in _REFLECTION_VOLATILE_KEYS
+        }
+    if isinstance(value, list):
+        return [_normalize_reflection_value(item) for item in value]
+    return value
+
+
+def _reflection_fingerprint(value: Any) -> str:
+    serialized = json.dumps(
+        _normalize_reflection_value(value),
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _runtime_inspector_status(state: StateStore, session_id: int, run_id: str | None = None) -> dict[str, Any]:
+    """Build an allowlisted, read-only inspection summary from this session's persisted rows."""
+    run = state.get_run(run_id) if run_id else None
+    if run_id and (run is None or run["session_id"] != session_id):
+        return {}
+    if run is None:
+        runs = state.list_runs(session_id, 20)
+        run = runs[0] if runs else None
+        run_id = run["run_id"] if run else None
+
+    runtime: dict[str, Any] = {}
+    if run_id:
+        for call in reversed(state.list_provider_calls(run_id)):
+            if call["purpose"] != "agent":
+                continue
+            request = state.get_provider_request(call["id"])
+            messages = request.get("messages", []) if isinstance(request, dict) else []
+            for message in messages:
+                if isinstance(message, dict) and message.get("role") == "system":
+                    parsed = extract_runtime_context(message.get("content", ""))
+                    if parsed is not None:
+                        runtime = parsed
+                        break
+            if runtime:
+                break
+
+    goals = state.list_goals(session_id)
+    goal = next((item for item in goals if run_id and run_id in item["runs"]), None)
+    if goal is None and run_id is None and goals:
+        goal = goals[0]
+
+    goal_reflection = goal["reflections"][-1] if goal and goal.get("reflections") else None
+    tool_reflections = state.list_tool_reflections(session_id, limit=3)
+    tool_reflection = next(
+        (item for item in tool_reflections if item["run_id"] == run_id),
+        tool_reflections[0] if run_id is None and tool_reflections else None,
+    )
+    candidates = [item for item in (goal_reflection, tool_reflection) if item]
+    reflection = max(candidates, key=lambda item: item.get("created_at", "")) if candidates else None
+
+    def short(value: Any, limit: int = 512) -> str | None:
+        return value[:limit] if isinstance(value, str) else None
+
+    goal_summary = short(goal.get("status"), 32) if goal else None
+    latest_reflection = None
+    blocker = None
+    next_action = None
+    recovery_guidance = None
+    last_evidence: list[str] = []
+    check_result = None
+    lessons: list[dict[str, Any]] = []
+    if goal:
+        if goal_reflection:
+            observed = goal_reflection.get("observed", {})
+            check_result = {
+                "observed_passed": observed.get("passed") if isinstance(observed, dict) else None,
+                "followup_passed": goal_reflection.get("following_check_passed"),
+                "detail": short(observed.get("detail"), 256) if isinstance(observed, dict) else None,
+            }
+        for check in goal.get("checks", []):
+            if len(lessons) >= 3:
+                break
+            check_type = check.get("type")
+            check_key = (
+                Path(check["argv"][0]).name[:128]
+                if check_type == "command" and isinstance(check.get("argv"), list) and check["argv"]
+                else str(check.get("path", ""))[:256]
+            )
+            if not check_type or not check_key:
+                continue
+            for item in state.list_goal_lessons(
+                session_id, check_type=check_type, check_key=check_key,
+                limit=3 - len(lessons),
+            ):
+                lessons.append({
+                    "check_type": short(item.get("check_type"), 32),
+                    "check_key": short(item.get("check_key"), 256),
+                    "status": short(item.get("status"), 16),
+                    "lesson": short(item.get("lesson"), 512),
+                    "support_count": item.get("support_count"),
+                    "evidence_ids": [short(value, 128) for value in item.get("evidence_ids", [])[:3]],
+                })
+
+    if reflection:
+        is_goal_reflection = "expected" in reflection and "observed" in reflection
+        if is_goal_reflection:
+            observed = reflection.get("observed", {})
+            latest_reflection = {
+                "trigger": short(reflection.get("trigger"), 64) or "unknown",
+                "observed": {
+                    key: observed.get(key)
+                    for key in ("passed", "detail")
+                    if isinstance(observed, dict) and isinstance(observed.get(key), (str, bool))
+                },
+                "evidence_ids": [short(value, 128) for value in reflection.get("evidence_ids", [])[:4]],
+                "cause_hypothesis": short(reflection.get("cause_hypothesis"), 512),
+                "next_change": short(reflection.get("next_change"), 512),
+                "following_check_passed": reflection.get("following_check_passed"),
+                "repeat_count": reflection.get("repeat_count"),
+                "blocker": bool(reflection.get("blocker")),
+            }
+            last_evidence = latest_reflection["evidence_ids"]
+            if reflection.get("blocker"):
+                blocker = "Repeated check/action failure threshold reached"
+            elif reflection.get("following_check_passed") is True:
+                blocker = None
+            elif reflection.get("following_check_passed") is False:
+                blocker = "Follow-up acceptance check still failed"
+            elif isinstance(observed, dict) and observed.get("passed") is False:
+                blocker = short(observed.get("detail"), 256) or "Acceptance check failed"
+            next_action = short(reflection.get("next_change"))
+        else:
+            observed = reflection.get("observed", {})
+            latest_reflection = {
+                "trigger": short(reflection.get("trigger"), 64),
+                "tool_name": short(reflection.get("tool_name"), 64),
+                "observed": {
+                    key: observed.get(key)
+                    for key in ("outcome", "repeat_count", "provider_turn_completed", "goal_status", "successful_tool_count", "known_failure_count")
+                    if isinstance(observed, dict) and isinstance(observed.get(key), (str, int, bool))
+                },
+                "evidence_ids": [short(value, 128) for value in reflection.get("evidence_ids", [])[:4]],
+                "repeat_count": reflection.get("repeat_count"),
+                "blocker": bool(reflection.get("blocker")),
+                "run_id": short(reflection.get("run_id"), 128),
+            }
+            last_evidence = latest_reflection["evidence_ids"]
+            if reflection.get("blocker"):
+                blocker = "Repeated known tool failure threshold reached"
+                recovery_guidance = "Choose a materially different action or report a blocker"
+            elif reflection.get("trigger") == "run_concluded":
+                recovery_guidance = "Check acceptance/goal status; provider-turn completion is not goal completion"
+
+    if not last_evidence:
+        progress = runtime.get("progress", {})
+        raw_evidence = progress.get("evidence_ids", []) if isinstance(progress, dict) else []
+        if isinstance(raw_evidence, list):
+            last_evidence = [short(item, 128) for item in raw_evidence[:4] if isinstance(item, str)]
+
+    tool_outcome = None
+    if run_id:
+        run_tools = [call for call in state.list_tool_calls(session_id) if call["run_id"] == run_id]
+        if run_tools:
+            tool_outcome = {
+                "tool_name": short(run_tools[-1].get("name"), 64),
+                "status": short(run_tools[-1].get("status"), 16),
+            }
+
+    identity = runtime.get("identity", {})
+    assignment = runtime.get("assignment", {})
+    environment = runtime.get("environment", {})
+    progress = runtime.get("progress", {})
+    return {
+        "role": short(identity.get("role"), 64) if isinstance(identity, dict) else None,
+        "agent": short(identity.get("agent_name"), 64) if isinstance(identity, dict) else None,
+        "assignment": short(assignment.get("my_task"), 512) if isinstance(assignment, dict) else None,
+        "purpose": short(assignment.get("purpose"), 512) if isinstance(assignment, dict) else None,
+        "required_output": short(assignment.get("required_output"), 256) if isinstance(assignment, dict) else None,
+        "acceptance_check_ids": [short(item, 128) for item in assignment.get("acceptance_check_ids", [])[:12] if isinstance(item, str)]
+        if isinstance(assignment, dict) and isinstance(assignment.get("acceptance_check_ids"), list) else None,
+        "workspace": short(environment.get("workspace"), 256) if isinstance(environment, dict) else None,
+        "phase": short(progress.get("phase"), 64) if isinstance(progress, dict) else None,
+        "last_evidence": last_evidence,
+        "blocker": blocker,
+        "next_action": next_action,
+        "recovery_guidance": recovery_guidance,
+        "latest_reflection": latest_reflection,
+        "lessons": lessons,
+        "tool_outcome": tool_outcome,
+        "check_result": check_result,
+        "goal_status": goal_summary,
+    }
+
+
+@dataclass
+class _RunControl:
+    session_id: int
+    cancellation: Event = field(default_factory=Event)
+    thread: Thread | None = None
+    providers: list[Any] = field(default_factory=list)
+
+
+class WebApp:
+    """A threaded HTTP shell; each request/worker opens its own SQLite connection."""
+
+    def __init__(self, config: Config, provider_factory: ProviderFactory | None = None):
+        if not config.web_username or not config.web_password_hash:
+            raise ValueError("DAGI_WEB_USERNAME and DAGI_WEB_PASSWORD_HASH are required for dagi-web")
+        if (
+            not config.web_cookie_path.startswith("/")
+            or ";" in config.web_cookie_path
+            or "\r" in config.web_cookie_path
+            or "\n" in config.web_cookie_path
+        ):
+            raise ValueError("DAGI_WEB_COOKIE_PATH must be an absolute cookie path")
+        self.config = config
+        self.provider_factory = provider_factory or OpenAICompatibleProvider
+        self.agent_id = str(uuid4())
+        self._runs: dict[str, _RunControl] = {}
+        self._goals: dict[str, _RunControl] = {}
+        self._lock = Lock()
+        self.approvals = ApprovalRegistry(self.config.web_command_approval_timeout)
+        self._lease: RuntimeLease | None = None
+        self._session_secret = secrets.token_bytes(32)
+        self._revoked_sessions: dict[str, int] = {}
+        self._failed_logins: dict[str, tuple[int, float]] = {}
+        self.workers = load_workers(os.environ.get("DAGI_WORKERS", "{}"))
+        # The built-in agents ship with the code: a redeploy must not leave
+        # the factory empty. Existing agents are never overwritten.
+        from .factory_seed import install_builtin_agents
+        try:
+            with _StateContext(StateStore(self.config.database)) as state:
+                install_builtin_agents(state)
+        except Exception:  # a broken seed must not take the service down
+            pass
+
+    def _cookie_token(self, headers: Any) -> str | None:
+        cookie = SimpleCookie()
+        try:
+            cookie.load(headers.get("Cookie", ""))
+            return cookie["dagi_session"].value if "dagi_session" in cookie else None
+        except Exception:
+            return None
+
+    def _is_authenticated(self, headers: Any) -> bool:
+        bearer = headers.get("Authorization", "")
+        if self.config.web_token and hmac.compare_digest(
+            bearer, "Bearer " + self.config.web_token
+        ):
+            return True
+        token = self._cookie_token(headers)
+        if not token or not verify_session_token(
+            token, self.config.web_username, self._session_secret
+        ):
+            return False
+        now = int(time.time())
+        with self._lock:
+            for revoked, expiry in list(self._revoked_sessions.items()):
+                if expiry <= now:
+                    del self._revoked_sessions[revoked]
+            return token not in self._revoked_sessions
+
+    def _origin_allowed(self, headers: Any) -> bool:
+        origin = headers.get("Origin")
+        expected = self.config.web_public_origin
+        return not origin or not expected or origin.rstrip("/") == expected
+
+    def _login_blocked(self, remote_addr: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            attempts, blocked_until = self._failed_logins.get(remote_addr, (0, 0.0))
+            if blocked_until > now:
+                return True
+            if blocked_until:
+                self._failed_logins.pop(remote_addr, None)
+        return False
+
+    def _failed_login(self, remote_addr: str) -> None:
+        now = time.monotonic()
+        with self._lock:
+            attempts, blocked_until = self._failed_logins.get(remote_addr, (0, 0.0))
+            if blocked_until > now:
+                return
+            attempts += 1
+            self._failed_logins[remote_addr] = (0, now + 60.0) if attempts >= 5 else (attempts, 0.0)
+
+    def _successful_login(self, remote_addr: str) -> None:
+        with self._lock:
+            self._failed_logins.pop(remote_addr, None)
+
+    def _revoke_session(self, token: str) -> None:
+        with self._lock:
+            self._revoked_sessions[token] = int(time.time()) + 43_200
+
+    @staticmethod
+    def _cancel_control(control: _RunControl) -> None:
+        control.cancellation.set()
+        for provider in tuple(control.providers):
+            cancel = getattr(provider, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:
+                    pass
+
+    def close(self) -> None:
+        with self._lock:
+            controls = list({id(item): item for item in [*self._runs.values(), *self._goals.values()]}.values())
+        for control in controls:
+            self._cancel_control(control)
+        for control in controls:
+            if control.thread is not None:
+                control.thread.join(timeout=3)
+        if all(control.thread is None or not control.thread.is_alive() for control in controls):
+            if self._lease is not None:
+                self._lease.close()
+                self._lease = None
+
+    def create_server(self, host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
+        if self._lease is not None:
+            raise ValueError("this WebApp already owns a runtime lease")
+        lease = RuntimeLease(self.config.home)
+        self._lease = lease
+        try:
+            with _StateContext(StateStore(self.config.database)) as state:
+                state.recover_interrupted()
+                state.recover_goals()
+        except BaseException:
+            lease.close()
+            self._lease = None
+            raise
+        app = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: Any) -> None:
+                return
+
+            def _send_json(
+                self, status: int, payload: Any, headers: dict[str, str] | None = None
+            ) -> None:
+                data = json.dumps(_json_safe(payload), ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                for name, value in (headers or {}).items():
+                    self.send_header(name, value)
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _read_json(self) -> dict[str, Any]:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length < 0 or length > 64_000:
+                    raise ValueError("request body must be at most 64 KB")
+                data = self.rfile.read(length)
+                value = json.loads(data or b"{}")
+                if not isinstance(value, dict):
+                    raise ValueError("request body must be a JSON object")
+                return value
+
+            def _state(self) -> StateStore:
+                # This handler runs in a dedicated HTTP thread; never share connections.
+                return StateStore(app.config.database)
+
+            def do_GET(self) -> None:
+                parsed = urlparse(self.path)
+                path = parsed.path
+                try:
+                    if path in {"/", "/app.js"}:
+                        self._static(path)
+                    elif path == "/api/auth/session":
+                        if app._is_authenticated(self.headers):
+                            self._send_json(200, {"authenticated": True})
+                        else:
+                            self._send_json(401, {"error": "authentication required"})
+                    elif path.startswith("/api/") and not app._is_authenticated(self.headers):
+                        self._send_json(401, {"error": "authentication required"})
+                    elif path == "/api/health":
+                        self._send_json(200, {
+                            "healthy": True,
+                            "active_runs": len(app._runs),
+                            "active_goals": len(app._goals),
+                        })
+                    elif path == "/api/workers":
+                        self._send_json(200, {"workers": [
+                            {"id": name, "url": worker.url}
+                            for name, worker in app.workers.items()
+                        ]})
+                    elif match := re.fullmatch(r"/api/workers/([A-Za-z0-9_-]+)/proxy(/api/.*)", path):
+                        self._proxy(match.group(1), match.group(2))
+                    elif path == "/api/approvals":
+                        self._send_json(200, {"approvals": app.approvals.pending()})
+                    elif path == "/api/templates":
+                        with _StateContext(self._state()) as state:
+                            self._send_json(200, {"templates": state.list_templates()})
+                    elif match := re.fullmatch(r"/api/sessions/(\d+)/artifacts", path):
+                        self._send_json(200, {"artifacts": app.list_artifacts(int(match.group(1)))})
+                    elif match := re.fullmatch(r"/api/sessions/(\d+)/artifacts/(.+)", path):
+                        self._send_artifact(int(match.group(1)), match.group(2))
+                    elif path == "/api/sessions":
+                        with _StateContext(self._state()) as state:
+                            sessions = state.list_sessions(100)
+                            for session in sessions:
+                                session["runs"] = state.list_runs(session["id"], 20)
+                                session["goals"] = state.list_goals(session["id"])
+                            self._send_json(200, {"sessions": sessions})
+                    elif match := re.fullmatch(r"/api/sessions/(\d+)", path):
+                        session_id = int(match.group(1))
+                        with _StateContext(self._state()) as state:
+                            snapshot = state.session_snapshot(session_id)
+                            if snapshot is None:
+                                self._send_json(404, {"error": "session not found"})
+                                return
+                            snapshot["runtime_status"] = _runtime_inspector_status(state, session_id)
+                            self._send_json(200, snapshot)
+                    elif match := re.fullmatch(r"/api/goals/([^/]+)", path):
+                        with _StateContext(self._state()) as state:
+                            goal = state.get_goal(match.group(1))
+                            if goal is None:
+                                self._send_json(404, {"error": "goal not found"})
+                                return
+                            self._send_json(200, {"goal": goal})
+                    elif match := re.fullmatch(r"/api/runs/([^/]+)/events", path):
+                        if parse_qs(parsed.query).get("format") == ["json"]:
+                            self._event_page(match.group(1), parsed.query)
+                        else:
+                            self._stream_events(match.group(1), parsed.query)
+                    elif match := re.fullmatch(r"/api/runs/([^/]+)", path):
+                        self._run_detail(match.group(1))
+                    else:
+                        self._send_json(404, {"error": "not found"})
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self._send_json(400, {"error": str(exc)})
+                except Exception:
+                    self._send_json(500, {"error": "sandbox request failed"})
+
+            def do_POST(self) -> None:
+                parsed = urlparse(self.path)
+                try:
+                    body = self._read_json()
+                    if not app._origin_allowed(self.headers):
+                        self._send_json(403, {"error": "request origin is not allowed"})
+                        return
+                    if parsed.path == "/api/auth/login":
+                        remote_addr = self.headers.get("X-Real-IP", self.client_address[0])
+                        if app._login_blocked(remote_addr):
+                            self._send_json(429, {"error": "too many login attempts"}, {"Retry-After": "60"})
+                            return
+                        username = body.get("username")
+                        password = body.get("password")
+                        valid_user = isinstance(username, str) and hmac.compare_digest(
+                            username.encode("utf-8"), app.config.web_username.encode("utf-8")
+                        )
+                        valid_password = isinstance(password, str) and len(password) <= 4096 and verify_password(
+                            password, app.config.web_password_hash
+                        )
+                        if not valid_user or not valid_password:
+                            app._failed_login(remote_addr)
+                            self._send_json(401, {"error": "invalid username or password"})
+                            return
+                        app._successful_login(remote_addr)
+                        token = create_session_token(app.config.web_username, app._session_secret)
+                        cookie = (
+                            f"dagi_session={token}; Path={app.config.web_cookie_path}; "
+                            "HttpOnly; SameSite=Strict; Max-Age=43200"
+                        )
+                        if app.config.web_cookie_secure:
+                            cookie += "; Secure"
+                        self._send_json(
+                            200,
+                            {"authenticated": True},
+                            {"Set-Cookie": cookie},
+                        )
+                    elif parsed.path == "/api/auth/logout":
+                        token = app._cookie_token(self.headers)
+                        if token and app._is_authenticated(self.headers):
+                            app._revoke_session(token)
+                        cookie = (
+                            f"dagi_session=; Path={app.config.web_cookie_path}; "
+                            "HttpOnly; SameSite=Strict; Max-Age=0"
+                        )
+                        if app.config.web_cookie_secure:
+                            cookie += "; Secure"
+                        self._send_json(200, {"authenticated": False}, {"Set-Cookie": cookie})
+                    elif parsed.path.startswith("/api/") and not app._is_authenticated(self.headers):
+                        self._send_json(401, {"error": "authentication required"})
+                    elif match := re.fullmatch(r"/api/workers/([A-Za-z0-9_-]+)/proxy(/api/.*)", parsed.path):
+                        self._proxy(match.group(1), match.group(2), body)
+                    elif match := re.fullmatch(r"/api/sessions/(\d+)/goals", parsed.path):
+                        self._send_json(202, app.start_goal(int(match.group(1)), body))
+                    elif match := re.fullmatch(r"/api/goals/([^/]+)/(stop|resume)", parsed.path):
+                        self._send_json(202, app.control_goal(match.group(1), match.group(2)))
+                    elif match := re.fullmatch(r"/api/approvals/([^/]+)", parsed.path):
+                        approved = body.get("approved")
+                        if type(approved) is not bool:
+                            raise ValueError("approved must be boolean")
+                        if not app.approvals.decide(match.group(1), approved):
+                            self._send_json(404, {"error": "approval not found or already decided"})
+                            return
+                        self._send_json(200, {"decided": True, "approved": approved})
+                    elif parsed.path == "/api/sessions/purge":
+                        if body.get("confirm") != "DELETE ALL":
+                            raise ValueError("purge requires the confirmation \"DELETE ALL\"")
+                        keep = body.get("keep_session_id")
+                        if keep is not None and (type(keep) is not int or keep < 1):
+                            raise ValueError("keep_session_id must be a positive integer")
+                        with _StateContext(self._state()) as state:
+                            result = state.delete_all_sessions(keep_session_id=keep)
+                        self._send_json(200, result)
+                    elif parsed.path == "/api/templates":
+                        name = body.get("name")
+                        if not isinstance(name, str) or not name.strip():
+                            raise ValueError("template name must be text")
+                        source_session_id = body.get("source_session_id")
+                        if source_session_id is not None and (type(source_session_id) is not int or source_session_id < 1):
+                            raise ValueError("source_session_id must be a positive integer")
+                        brief = body.get("brief", "")
+                        if not isinstance(brief, str):
+                            raise ValueError("brief must be text")
+                        task = body.get("task")
+                        if task is not None and not isinstance(task, str):
+                            raise ValueError("task must be text")
+                        with _StateContext(self._state()) as state:
+                            template = state.upsert_template(
+                                name, source_session_id=source_session_id, task=task, brief=brief,
+                            )
+                        self._send_json(201, {"template": template})
+                    elif match := re.fullmatch(r"/api/templates/([^/]+)/clone", parsed.path):
+                        with _StateContext(self._state()) as state:
+                            clone = state.clone_template(match.group(1))
+                        self._send_json(201, {"clone": clone})
+                    elif parsed.path == "/api/sessions":
+                        title = body.get("title")
+                        if title is not None and not isinstance(title, str):
+                            raise ValueError("title must be text")
+                        # Every session gets its own workspace, so the artifacts
+                        # of one agent never mix with another agent's files.
+                        workspace = f"sessions/{uuid4().hex}"
+                        with _StateContext(self._state()) as state:
+                            session_id = state.create_session(title, workspace=workspace)
+                        self._send_json(201, {"session_id": session_id, "workspace": workspace})
+                    elif match := re.fullmatch(r"/api/sessions/(\d+)/runs", parsed.path):
+                        self._start_run(int(match.group(1)), body)
+                    elif match := re.fullmatch(r"/api/runs/([^/]+)/cancel", parsed.path):
+                        self._cancel_run(match.group(1))
+                    else:
+                        self._send_json(404, {"error": "not found"})
+                except RuntimeError as exc:
+                    self._send_json(409, {"error": str(exc)})
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self._send_json(400, {"error": str(exc)})
+                except Exception:
+                    self._send_json(500, {"error": "sandbox request failed"})
+
+            def do_DELETE(self) -> None:
+                parsed = urlparse(self.path)
+                try:
+                    if not app._origin_allowed(self.headers):
+                        self._send_json(403, {"error": "request origin is not allowed"})
+                        return
+                    if parsed.path.startswith("/api/") and not app._is_authenticated(self.headers):
+                        self._send_json(401, {"error": "authentication required"})
+                        return
+                    if match := re.fullmatch(r"/api/templates/([^/]+)", parsed.path):
+                        with _StateContext(self._state()) as state:
+                            state.delete_template(match.group(1))
+                        self._send_json(200, {"deleted": True})
+                    elif match := re.fullmatch(r"/api/sessions/(\d+)", parsed.path):
+                        with _StateContext(self._state()) as state:
+                            result = state.delete_session(int(match.group(1)))
+                        self._send_json(200, result)
+                    else:
+                        self._send_json(404, {"error": "not found"})
+                except ValueError as exc:
+                    self._send_json(404, {"error": str(exc)})
+                except Exception:
+                    self._send_json(500, {"error": "sandbox request failed"})
+
+            def _send_artifact(self, session_id: int, name: str) -> None:
+                try:
+                    path = app.artifact_path(session_id, name)
+                except ValueError as exc:
+                    self._send_json(404, {"error": str(exc)})
+                    return
+                data = path.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header(
+                    "Content-Disposition", f'attachment; filename="{path.name}"'
+                )
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _proxy(self, worker_id: str, path: str, body: dict[str, Any] | None = None) -> None:
+                worker = app.workers.get(worker_id)
+                allowed = re.fullmatch(
+                    r"/api/(?:health|sessions|sessions/\d+(?:/(?:runs|goals))?|runs/[^/]+(?:/events|/cancel)?|goals/[^/]+(?:/(?:stop|resume))?)",
+                    path,
+                )
+                if worker is None or not allowed:
+                    self._send_json(404, {"error": "worker or endpoint not found"})
+                    return
+                try:
+                    result = worker.request(path, "POST" if body is not None else "GET", body)
+                except Exception:
+                    # The peer response may contain sensitive material; do not relay it.
+                    self._send_json(502, {"error": "worker request failed"})
+                    return
+                self._send_json(200, result)
+
+            def _static(self, path: str) -> None:
+                name = "index.html" if path == "/" else "app.js"
+                content_type = "text/html; charset=utf-8" if name.endswith(".html") else "text/javascript; charset=utf-8"
+                data = files("dagi_core").joinpath("static", name).read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _run_detail(self, run_id: str) -> None:
+                with _StateContext(self._state()) as state:
+                    run = state.get_run(run_id)
+                    if run is None:
+                        self._send_json(404, {"error": "run not found"})
+                        return
+                    provider_calls = state.list_provider_calls(run_id)
+                    requests = []
+                    for call in provider_calls:
+                        requests.append({
+                            "provider_call_id": call["id"],
+                            "purpose": call["purpose"],
+                            "model": call["model"],
+                            "request": state.get_provider_request(call["id"]),
+                        })
+                    tool_calls = [
+                        call for call in state.list_tool_calls(run["session_id"])
+                        if call["run_id"] == run_id
+                    ]
+                    prices = app.config.usage_policy.prices
+                    self._send_json(200, {
+                        "run": run,
+                        "parent": state.get_run(run["parent_run_id"]) if run["parent_run_id"] else None,
+                        "usage": state.usage_summary(run_id),
+                        "budget_usage": state.usage_summary_for_budget(run_id),
+                        "cost_status": state.cost_status(run_id, prices),
+                        "budget_cost_status": state.cost_status(run_id, prices, group=True),
+                        "provider_calls": provider_calls,
+                        "requests": requests,
+                        "tool_calls": tool_calls,
+                        "children": state.list_child_runs(run_id),
+                        "messages": state.message_records(run["session_id"]),
+                        "event_count": len(state.list_run_events(run_id, limit=5000)),
+                        "runtime_status": _runtime_inspector_status(state, run["session_id"], run_id),
+                    })
+
+            def _event_page(self, run_id: str, query: str) -> None:
+                params = parse_qs(query)
+                if "through" not in params:
+                    raise ValueError("a through cursor is required for event paging")
+                after = int(params.get("after", ["0"])[0])
+                through = int(params["through"][0])
+                limit = int(params.get("limit", ["500"])[0])
+                if after < 0 or through < 0 or not 1 <= limit <= 1000:
+                    raise ValueError("event cursors must be non-negative and page size must be 1..1000")
+                with _StateContext(self._state()) as state:
+                    if state.get_run(run_id) is None:
+                        self._send_json(404, {"error": "run not found"})
+                        return
+                    rows = state.list_run_events(
+                        run_id, after_id=after, through_id=through, limit=limit + 1
+                    )
+                    events = rows[:limit]
+                    self._send_json(200, {
+                        "run_id": run_id,
+                        "through": through,
+                        "events": events,
+                        "has_more": len(rows) > limit,
+                        "next_after": events[-1]["id"] if events else after,
+                    })
+
+            def _stream_events(self, run_id: str, query: str) -> None:
+                params = parse_qs(query)
+                after = int(params.get("after", ["0"])[0])
+                last_header = self.headers.get("Last-Event-ID")
+                if last_header:
+                    after = max(after, int(last_header))
+                state = self._state()
+                try:
+                    run = state.get_run(run_id)
+                    if run is None:
+                        self._send_json(404, {"error": "run not found"})
+                        return
+                    self.close_connection = True
+                    self.send_response(200)
+                    self.send_header("Connection", "close")
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache, no-transform")
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.end_headers()
+                    while True:
+                        rows = state.list_run_events(run_id, after_id=after)
+                        for row in rows:
+                            frame = f"id: {row['id']}\ndata: {json.dumps(row['event'], ensure_ascii=False)}\n\n"
+                            self.wfile.write(frame.encode("utf-8"))
+                            self.wfile.flush()
+                            after = row["id"]
+                        run = state.get_run(run_id)
+                        if run is None or run["status"] != "running":
+                            # The run is over: the last event has to reach the
+                            # reader before the connection is closed, otherwise
+                            # the reader only sees a run that never finished.
+                            rows = state.list_run_events(run_id, after_id=after)
+                            for row in rows:
+                                frame = f"id: {row['id']}\ndata: {json.dumps(row['event'], ensure_ascii=False)}\n\n"
+                                self.wfile.write(frame.encode("utf-8"))
+                                self.wfile.flush()
+                                after = row["id"]
+                            break
+                        time.sleep(0.05)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                finally:
+                    state.close()
+
+            def _start_run(self, session_id: int, body: dict[str, Any]) -> None:
+                self._send_json(202, app.start_run(session_id, body.get("message")))
+
+            def _cancel_run(self, run_id: str) -> None:
+                with app._lock:
+                    control = app._runs.get(run_id)
+                if control is None:
+                    self._send_json(409, {"error": "run is not active"})
+                    return
+                control.cancellation.set()
+                for provider in tuple(control.providers):
+                    cancel = getattr(provider, "cancel", None)
+                    if callable(cancel):
+                        try:
+                            cancel()
+                        except Exception:
+                            pass
+                self._send_json(202, {"run_id": run_id, "status": "cancelling"})
+
+        class OwnedServer(ThreadingHTTPServer):
+            daemon_threads = True
+
+            def server_close(self) -> None:
+                app.close()
+                super().server_close()
+
+        try:
+            return OwnedServer((host, port), Handler)
+        except BaseException:
+            app.close()
+            raise
+
+    def start_run(self, session_id: int, message: str) -> dict[str, Any]:
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("message must be non-empty text")
+        with self._lock:
+            if self._session_busy(session_id):
+                raise RuntimeError("a run is already active for this session")
+            with _StateContext(StateStore(self.config.database)) as state:
+                if state.get_session(session_id) is None:
+                    raise ValueError("session not found")
+                run_id = state.create_run(session_id, agent_id=self.agent_id, agent_name=self.config.model)
+            control = _RunControl(session_id)
+            self._runs[run_id] = control
+            control.thread = Thread(target=self._execute_run, args=(run_id, session_id, message, control), daemon=True)
+            control.thread.start()
+        return {"run_id": run_id, "session_id": session_id, "status": "running"}
+
+    def _session_busy(self, session_id: int) -> bool:
+        return any(
+            control.session_id == session_id
+            for control in [*self._runs.values(), *self._goals.values()]
+        )
+
+    def start_goal(self, session_id: int, body: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(body, dict):
+            raise ValueError("goal request must be a JSON object")
+        allowed_fields = {"objective", "checks", "max_iterations"}
+        extra_fields = set(body) - allowed_fields
+        if extra_fields:
+            raise ValueError("goal capability settings are operator-configured, not request fields")
+        objective = body.get("objective")
+        cap = body.get("max_iterations", 5)
+        if not isinstance(objective, str) or not objective.strip() or len(objective) > 8_000:
+            raise ValueError("objective must be non-empty text of at most 8000 characters")
+        if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= 10:
+            raise ValueError("max_iterations must be 1..10")
+        checks = validate_checks(body.get("checks"))
+        if any(check["type"] == "command" for check in checks) and not self.config.enable_check_commands:
+            raise ValueError("command checks are disabled by operator configuration")
+
+        with self._lock, _StateContext(StateStore(self.config.database)) as state:
+            session = state.get_session(session_id)
+            if session is None:
+                raise ValueError("session not found")
+            workspace = resolve_session_workspace(self.config.workspace, session["workspace"])
+            workspace.mkdir(parents=True, exist_ok=True)
+            for check in checks:
+                if check["type"] != "command":
+                    _resolve(workspace, check["path"])
+            if self._session_busy(session_id):
+                raise RuntimeError("a run or goal is already active for this session")
+            goal_id = state.create_goal(session_id, objective, checks, cap)
+            self._launch_goal(goal_id, session_id)
+            created = state.get_goal(goal_id)
+            if created is None:
+                raise RuntimeError("created goal could not be read back")
+            return created
+
+    def _launch_goal(self, goal_id: str, session_id: int) -> None:
+        control = _RunControl(session_id)
+        self._goals[goal_id] = control
+        control.thread = Thread(target=self._drive_goal, args=(goal_id, control), daemon=True)
+        control.thread.start()
+
+    def control_goal(self, goal_id: str, action: str) -> dict[str, Any]:
+        if action not in {"stop", "resume"}:
+            raise ValueError("goal action must be stop or resume")
+        if action == "stop":
+            with self._lock:
+                control = self._goals.get(goal_id)
+            if control is not None:
+                self._cancel_control(control)
+            with _StateContext(StateStore(self.config.database)) as state:
+                goal = state.get_goal(goal_id)
+                if goal is None:
+                    raise ValueError("goal not found")
+                if control is None and goal["status"] == "running":
+                    state.update_goal(goal_id, "interrupted")
+                updated = state.get_goal(goal_id)
+                if updated is None:
+                    raise RuntimeError("goal disappeared while stopping")
+                return updated
+
+        with self._lock, _StateContext(StateStore(self.config.database)) as state:
+            goal = state.get_goal(goal_id)
+            if goal is None:
+                raise ValueError("goal not found")
+            if goal["status"] not in {"interrupted", "error"}:
+                raise ValueError("only interrupted or error goals can resume")
+            if self._session_busy(goal["session_id"]):
+                raise RuntimeError("a run or goal is already active for this session")
+            state.update_goal(goal_id, "running")
+            self._launch_goal(goal_id, goal["session_id"])
+            updated = state.get_goal(goal_id)
+            if updated is None:
+                raise RuntimeError("goal disappeared while resuming")
+            return updated
+
+    def _drive_goal(self, goal_id: str, control: _RunControl) -> None:
+        state = StateStore(self.config.database)
+        try:
+            while True:
+                goal = state.get_goal(goal_id)
+                if goal is None:
+                    return
+                session = state.get_session(goal["session_id"])
+                if session is None:
+                    raise ValueError("goal session not found")
+                workspace = resolve_session_workspace(self.config.workspace, session["workspace"])
+                feedback = verify(
+                    workspace,
+                    goal["checks"],
+                    allow_commands=self.config.enable_check_commands,
+                    cancellation=control.cancellation,
+                )
+                if control.cancellation.is_set():
+                    state.update_goal(goal_id, "interrupted", feedback=feedback)
+                    return
+                latest_run_id = goal["runs"][-1] if goal["runs"] else None
+                latest_calls = (
+                    [call for call in state.list_tool_calls(goal["session_id"]) if call["run_id"] == latest_run_id]
+                    if latest_run_id else []
+                )
+                followup_evidence_ids = ([latest_run_id] if latest_run_id else [])
+                followup_evidence_ids.extend(call["tool_call_id"] for call in latest_calls[:10])
+                observed_tool_names = list(dict.fromkeys(call["name"] for call in latest_calls))
+                followup_action_fingerprint = _reflection_fingerprint([
+                    {"name": call["name"], "arguments": call["arguments"]}
+                    for call in latest_calls
+                ])
+                next_change = (
+                    "Observed tool calls: " + ", ".join(observed_tool_names)
+                    if observed_tool_names else "No tool calls were recorded in the following run."
+                )
+                for check_index, item in enumerate(feedback):
+                    updated_reflection = state.update_goal_reflection_followup(
+                        goal_id,
+                        check_index,
+                        bool(item["passed"]),
+                        next_change=next_change,
+                        evidence_ids=followup_evidence_ids[:12],
+                        next_action_fingerprint=followup_action_fingerprint,
+                    )
+                    if updated_reflection and item["passed"]:
+                        reflection = state.get_latest_goal_reflection(goal_id, check_index)
+                        if reflection and reflection["following_check_passed"] is True:
+                            expected = reflection["expected"]
+                            check_type = expected["type"]
+                            check_key = expected.get("path", expected.get("executable", ""))
+                            pattern_fingerprint = goal_lesson_fingerprint(
+                                check_type, check_key, reflection["next_action_fingerprint"]
+                            )
+                            lesson = (
+                                f"Observed {check_type} check for {check_key or 'configured target'} pass "
+                                f"after following action(s): {', '.join(observed_tool_names) or 'no tool calls'}."
+                            )
+                            state.record_goal_lesson(
+                                session_id=goal["session_id"],
+                                goal_id=goal_id,
+                                reflection_id=reflection["id"],
+                                check_type=check_type,
+                                check_key=check_key,
+                                pattern_fingerprint=pattern_fingerprint,
+                                lesson=lesson[:512],
+                                evidence_ids=reflection["evidence_ids"],
+                            )
+                if all(item["passed"] for item in feedback):
+                    state.update_goal(goal_id, "completed", feedback=feedback)
+                    return
+                action_fingerprint = followup_action_fingerprint
+                stop_for_repeated_failure = False
+                for check_index, item in enumerate(feedback):
+                    if item["passed"]:
+                        continue
+                    check = item["check"]
+                    if check["type"] == "command":
+                        expected = {
+                            "type": "command",
+                            "executable": Path(check["argv"][0]).name[:128],
+                            "argument_count": len(check["argv"]),
+                        }
+                        detail = item.get("detail")
+                        observed_detail = {
+                            "exit_code": detail.get("exit_code"),
+                            "timed_out": bool(detail.get("timed_out")),
+                            "stdout_truncated": bool(detail.get("stdout_truncated")),
+                            "stderr_truncated": bool(detail.get("stderr_truncated")),
+                        } if isinstance(detail, dict) else "command check failed"
+                    else:
+                        expected = {"type": check["type"], "path": str(check["path"])[:256]}
+                        if check["type"] == "file_contains":
+                            expected["required_text_length"] = len(check["text"])
+                        observed_detail = str(item.get("detail", ""))[:256]
+                    evidence_ids = [f"goal-check:{goal_id}:{goal['iteration']}:{check_index}"]
+                    if latest_run_id:
+                        evidence_ids.append(latest_run_id)
+                        evidence_ids.extend(call["tool_call_id"] for call in latest_calls[:10])
+                    observed = {"passed": False, "detail": observed_detail}
+                    reflection = state.record_goal_reflection(
+                        goal_id=goal_id,
+                        iteration=goal["iteration"],
+                        check_index=check_index,
+                        expected=expected,
+                        observed=observed,
+                        evidence_ids=evidence_ids[:12],
+                        failure_fingerprint=_reflection_fingerprint({
+                            "check_index": check_index, "expected": expected, "observed": observed,
+                        }),
+                        action_fingerprint=action_fingerprint,
+                        repeat_threshold=self.config.goal_repeat_failure_threshold,
+                    )
+                    state.reject_goal_lesson_with_evidence(
+                        session_id=goal["session_id"],
+                        goal_id=goal_id,
+                        reflection_id=reflection["id"],
+                        check_type=expected["type"],
+                        check_key=expected.get("path", expected.get("executable", "")),
+                        evidence_ids=reflection["evidence_ids"],
+                    )
+                    stop_for_repeated_failure = stop_for_repeated_failure or bool(reflection["blocker"])
+                if stop_for_repeated_failure:
+                    state.update_goal(goal_id, "capped", feedback=feedback)
+                    return
+                if goal["iteration"] >= goal["max_iterations"]:
+                    state.update_goal(goal_id, "capped", feedback=feedback)
+                    return
+                if goal["runs"]:
+                    budget_summary = state.usage_summary_for_budget(goal["runs"][-1])
+                else:
+                    budget_summary = {"provider_calls": 0, "cost_usd": 0}
+                if self.config.usage_policy.stop_reason(budget_summary):
+                    state.update_goal(goal_id, "limit", feedback=feedback)
+                    return
+
+                iteration = goal["iteration"] + 1
+                state.update_goal(goal_id, "running", iteration=iteration, feedback=feedback)
+                run_id = state.create_run(
+                    goal["session_id"],
+                    agent_id=self.agent_id,
+                    agent_name=self.config.model,
+                    budget_group_id=goal_id,
+                )
+                state.link_goal_run(goal_id, run_id)
+                with self._lock:
+                    self._runs[run_id] = control
+                message = (
+                    f"Goal: {goal['objective']}\nIteration {iteration}/{goal['max_iterations']}.\n"
+                    "Complete the work, but do not claim success unless the deterministic checks pass.\n"
+                    "Acceptance checks and latest failures:\n"
+                    + json.dumps(feedback, ensure_ascii=False)
+                )
+                reflections = state.list_goal_reflections(goal_id, limit=3)
+                if reflections:
+                    reflection_summary = [
+                        {
+                            "id": item["id"],
+                            "trigger": item["trigger"],
+                            "expected": item["expected"],
+                            "observed": item["observed"],
+                            "evidence_ids": item["evidence_ids"][:4],
+                            "cause_hypothesis": item["cause_hypothesis"],
+                            "next_change": item["next_change"],
+                            "following_check_passed": item["following_check_passed"],
+                            "repeat_count": item["repeat_count"],
+                            "blocker": item["blocker"],
+                        }
+                        for item in reflections
+                    ]
+                    message += (
+                        " Runtime reflection record (observed facts; hypotheses are not verified): "
+                        + json.dumps(reflection_summary, ensure_ascii=False)
+                        + " Use the evidence to change the next action; report a blocker rather than repeating an unchanged failed action."
+                    )
+                scoped_lessons = []
+                for check in goal["checks"]:
+                    if len(scoped_lessons) >= 3:
+                        break
+                    check_type = check["type"]
+                    check_key = Path(check["argv"][0]).name[:128] if check_type == "command" else str(check["path"])[:256]
+                    scoped_lessons.extend(state.list_goal_lessons(
+                        goal["session_id"], check_type=check_type, check_key=check_key,
+                        limit=3 - len(scoped_lessons),
+                    ))
+                if scoped_lessons:
+                    lesson_summary = [
+                        {
+                            "lesson": item["lesson"],
+                            "status": item["status"],
+                            "support_count": item["support_count"],
+                            "evidence_ids": item["evidence_ids"][-3:],
+                        }
+                        for item in scoped_lessons[:3]
+                    ]
+                    message += " Scoped lessons from this session: " + json.dumps(lesson_summary, ensure_ascii=False)
+                self._execute_run(run_id, goal["session_id"], message, control)
+                completed_run = state.get_run(run_id)
+                if completed_run is None:
+                    state.update_goal(goal_id, "error", feedback=feedback)
+                    return
+                if completed_run["status"] != "completed":
+                    goal_status = {
+                        "limit": "limit",
+                        "cancelled": "interrupted",
+                        "error": "error",
+                    }.get(completed_run["status"], "error")
+                    state.update_goal(goal_id, goal_status, feedback=feedback)
+                    return
+        except Exception as exc:
+            goal = state.get_goal(goal_id)
+            if goal is not None and goal["status"] == "running":
+                state.update_goal(
+                    goal_id,
+                    "error",
+                    feedback=[{"passed": False, "detail": f"goal controller error: {type(exc).__name__}"}],
+                )
+        finally:
+            state.close()
+            with self._lock:
+                self._goals.pop(goal_id, None)
+
+    def _register_provider(self, control: _RunControl, provider: Any) -> None:
+        with self._lock:
+            if not any(active is provider for active in control.providers):
+                control.providers.append(provider)
+            already_cancelled = control.cancellation.is_set()
+        if already_cancelled:
+            cancel = getattr(provider, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:
+                    pass
+
+    def _execute_run(self, run_id: str, session_id: int, message: str, control: _RunControl) -> None:
+        state = StateStore(self.config.database)
+        try:
+            provider = self.provider_factory(self.config.model, self.config.api_key, self.config.base_url)
+            compression_provider = self.provider_factory(
+                self.config.compression_model, self.config.api_key, self.config.base_url
+            )
+            with self._lock:
+                control.providers = [provider, compression_provider]
+                already_cancelled = control.cancellation.is_set()
+            if already_cancelled:
+                for active_provider in control.providers:
+                    cancel = getattr(active_provider, "cancel", None)
+                    if callable(cancel):
+                        cancel()
+            session = state.get_session(session_id)
+            if session is None:
+                raise ValueError("session not found")
+            workspace = resolve_session_workspace(self.config.workspace, session["workspace"])
+            tools = ToolRegistry(
+                workspace, state, session_id,
+                documents_enabled=self.config.enable_documents,
+                shell_enabled=self.config.web_enable_shell,
+                approve_shell=(
+                    lambda command: self.approvals.request(
+                        command, session_id=session_id, run_id=run_id
+                    )
+                ) if self.config.web_enable_shell else None,
+            )
+            profile_prompt = str(session.get("system_prompt") or "")
+            profile_tools = [str(item) for item in (session.get("profile_tools") or [])]
+            if profile_tools:
+                tools.restrict_to(profile_tools)
+            delegation = DelegationManager(
+                state,
+                self.config.workspace,
+                api_key=self.config.api_key,
+                base_url=self.config.base_url,
+                provider_factory=self.provider_factory,
+                usage_policy=self.config.usage_policy,
+                compression_model=self.config.compression_model,
+                context_limit_tokens=self.config.context_limit_tokens,
+                context_max_tool_result_chars=self.config.context_max_tool_result_chars,
+                max_depth=self.config.max_delegation_depth,
+                max_children=self.config.max_child_agents_per_run,
+                shell_enabled=False,
+                repeat_failure_threshold=self.config.goal_repeat_failure_threshold,
+            )
+            delegation.register(tools)
+            context = ContextBuilder(
+                state,
+                max_tokens=self.config.context_limit_tokens,
+                max_tool_result_chars=self.config.context_max_tool_result_chars,
+                compression_provider=compression_provider,
+                usage_policy=self.config.usage_policy,
+            )
+            agent = Agent(
+                provider,
+                tools,
+                state,
+                session_id,
+                system_prompt=profile_prompt or SYSTEM_PROMPT,
+                usage_policy=self.config.usage_policy,
+                context_builder=context,
+                agent_id=self.agent_id,
+                agent_name=self.config.model,
+                entry_point="web",
+                repeat_failure_threshold=self.config.goal_repeat_failure_threshold,
+            )
+            for _event in agent.run_turn(
+                message,
+                run_id=run_id,
+                cancel_event=control.cancellation,
+                register_provider=lambda active: self._register_provider(control, active),
+            ):
+                pass
+        except Exception as exc:
+            run = state.get_run(run_id)
+            if run is not None and run["status"] == "running":
+                error_text = f"web worker error: {type(exc).__name__}: {exc}"
+                for kind, text, status in (
+                    ("error", error_text, None),
+                    ("done", None, "error"),
+                ):
+                    event = {"kind": kind, "session_id": session_id, "run_id": run_id, "text": text, "status": status}
+                    state.append_run_event(session_id, run_id, event)
+                state.finish_run(run_id, "error", error_text)
+        finally:
+            state.close()
+            with self._lock:
+                self._runs.pop(run_id, None)
+
+    def list_artifacts(self, session_id: int) -> list[dict[str, Any]]:
+        """List the files a session produced, newest first."""
+        with _StateContext(StateStore(self.config.database)) as state:
+            session = state.get_session(session_id)
+        if session is None:
+            raise ValueError("session not found")
+        workspace = resolve_session_workspace(self.config.workspace, session["workspace"])
+        if not workspace.is_dir():
+            return []
+        items = []
+        for path in sorted(workspace.rglob("*")):
+            if not path.is_file() or path.name.startswith("~$"):
+                continue
+            items.append({
+                "name": path.relative_to(workspace).as_posix(),
+                "size_bytes": path.stat().st_size,
+                "kind": path.suffix.lower().lstrip(".") or "file",
+            })
+        items.sort(key=lambda item: item["name"])
+        return items[:200]
+
+    def artifact_path(self, session_id: int, name: str) -> Path:
+        """Resolve one artifact inside the session workspace, or refuse."""
+        with _StateContext(StateStore(self.config.database)) as state:
+            session = state.get_session(session_id)
+        if session is None:
+            raise ValueError("session not found")
+        workspace = resolve_session_workspace(self.config.workspace, session["workspace"])
+        relative = PurePosixPath(name)
+        if relative.is_absolute() or ".." in relative.parts or "\\" in name:
+            raise ValueError("artifact name must stay inside the session workspace")
+        path = workspace / relative
+        if not path.is_file():
+            raise ValueError("artifact not found")
+        if path.stat().st_size > 32 * 1024 * 1024:
+            raise ValueError("artifact is too large")
+        return path
+
+    def serve(self, host: str = "127.0.0.1", port: int = 8765) -> None:
+        server = self.create_server(host, port)
+        print(f"Dagi sandbox listening on http://{host}:{server.server_address[1]}")
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
+
+
+_EXPORT_SENSITIVE_KEY = re.compile(
+    r"(?i)(password|passwd|secret|api[_-]?key|api[_-]?token|access[_-]?token|refresh[_-]?token|authorization|cookie|credential|private[_-]?key|cvc|cvv)"
+)
+_EXPORT_AUTH_TEXT = re.compile(r"(?i)\b(authorization\b\s*[:=]\s*)bearer\s+[^\s,;]+")
+_EXPORT_KV_TEXT = re.compile(
+    r"(?i)\b(password|passwd|api[_-]?key|api[_-]?token|access[_-]?token|refresh[_-]?token|secret|cookie|credential)\b(\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+_EXPORT_TOKEN_PATTERNS = (
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"(?s)-----BEGIN [^-\n]*PRIVATE KEY-----.*?-----END [^-\n]*PRIVATE KEY-----"),
+)
+
+
+def _redact_export(value: Any) -> Any:
+    """Redact credential-shaped fields/text before returning a session download."""
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if isinstance(key, str) and _EXPORT_SENSITIVE_KEY.search(key)
+            else _redact_export(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_export(item) for item in value]
+    if isinstance(value, str):
+        value = _EXPORT_AUTH_TEXT.sub(r"\1Bearer [REDACTED]", value)
+        value = _EXPORT_KV_TEXT.sub(r"\1\2[REDACTED]", value)
+        for pattern in _EXPORT_TOKEN_PATTERNS:
+            value = pattern.sub("[REDACTED]", value)
+    return value
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+class _StateContext:
+    def __init__(self, state: StateStore):
+        self.state = state
+
+    def __enter__(self) -> StateStore:
+        return self.state
+
+    def __exit__(self, *_args: Any) -> None:
+        self.state.close()
+
+
+def main() -> None:
+    config = load_config()
+    host = os.environ.get("DAGI_WEB_HOST", "127.0.0.1")
+    port = int(os.environ.get("DAGI_WEB_PORT", "8765"))
+    WebApp(config).serve(host, port)
+
+
+if __name__ == "__main__":
+    main()

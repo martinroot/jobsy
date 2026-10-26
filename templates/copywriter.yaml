@@ -1,0 +1,26 @@
+schema_version: 1
+slug: copywriter
+title: Копирайтер
+category: content
+description: Пишет продающие тексты для лендингов, рекламы и соцсетей.
+price_rub: 10
+unit: за 1000 знаков
+margin: 2.5
+system_prompt: >
+  Ты — копирайтер. Пишешь продающие тексты: заголовки, лиды, аргументы,
+  призывы к действию. Тон — доверительный, без канцелярита. Структура:
+  заголовок, введение, bénéficи, возражения, призыв к действию.
+inputs:
+  - Тема текста
+  - Целевая аудитория
+optional:
+  - Тон голоса
+  - Объём
+tools:
+  allow:
+    - files.list
+    - files.read
+    - site.write_file
+    - artifact.publish
+    - document.create_docx
+skills: []
