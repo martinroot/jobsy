@@ -1,54 +1,56 @@
 # jobsy
 
-Система выполнения заказов на фриланс бирже.
+Jobsy — freelance order execution with AI agents.
 
-Каждый заказ — это чат. В чат загружается агент из шаблона (предобученный)
-со своим набором инструментов и ведёт проект до сдачи.
+Each order is a chat. A pre-trained agent is loaded from a template into the chat, receives the full order context, and works on the order using tools until delivery.
 
-## Архитектура
+## Architecture
 
 ```
-core/          Dagi core: цикл агента, состояние (SQLite), инструменты,
-               провайдер, учёт токенов (IN/КЕШ/OUT), бюджет
-bridge/        Мост заказ ↔ агент: сессия на заказ, запуск Runs,
-               стриминг дельт, публикация артефактов, учёт расходов
-chat/          Чат-система: REST API, WebSocket поток событий, история
-orders/        Заказы: создание, назначение агента, статусы, пакеты
-templates/     Шаблоны агентов (предобучение): SEO-текст, копирайтинг,
-               разработка и др.
-frontend/      Чат-UI: стриминг ответов, инструменты, артефакты
+core/          Agent core: run loop with event streaming, SQLite state
+               (sessions, runs, tool executions, provider calls), provider,
+               token accounting (IN / cache / OUT), budget, tools registry,
+               workspace, runtime lock, context, goals, delegation,
+               documents/DOCX, media
+bridge/        Order → agent bridge: session per order, run execution,
+               delta streaming, artifact publishing, usage logging
+chat/          Chat system: REST API, WebSocket event stream, order workspace
+orders/        Orders: creation, agent assignment, statuses,
+               package accounting (balance debited only on delivered result)
+templates/     Agent templates (pre-training): SEO text, copywriting, development
+frontend/      Chat UI: streaming responses, tool calls, artifacts
+run.py         FastAPI server: REST + WebSocket for orders, templates, artifacts
 ```
 
-## Поток работы
+## How it works
 
-1. Создать заказ (`POST /api/orders`) — шаблон агента, описание, цена.
-2. Назначить агента (`POST /api/orders/{number}/assign`) — агент загружается из шаблона.
-3. Запустить (`POST /api/orders/{number}/start`) — агент начинает работу, пишет в чат.
-4. Агент вызывает инструменты (файлы, веб, документы, медиа), стримит ответ в реальном времени.
-5. Заказ приходит к статусу `done` — результат и артефакты готовы к сдаче.
+1. Create an order (`POST /api/orders`) — agent template, work description, price.
+2. Assign an agent (`POST /api/orders/{number}/assign`) — the agent is loaded from the template.
+3. Start (`POST /api/orders/{number}/start`) — the agent session receives the full order context and begins work.
+4. The agent streams text and tool calls to the chat in real time, using tools (files, web, documents, media).
+5. When the order reaches `done`, the result and artifacts are ready for delivery.
 
-## Учёт
+## Accounting
 
-- У каждого заказа свой пакет (единица = 1 deliverable, например 1000 знаков).
-- Остаток списывается только за выданные результаты.
-- Токены и стоимость фиксируются по отчёту провайдера (actual) и по тарифам (estimate).
+- Each order has a paid package (1 unit = 1 deliverable, e.g. 1000 characters).
+- The balance is debited only when a result is delivered.
+- Tokens and cost are recorded from the provider report (actual) and from saved tariffs (estimate).
 
-## Запуск
+## Run
 
 ```bash
 cp .env.example .env
-# отредактируйте DAGI_BASE_URL и DAGI_WEB_TOKEN при необходимости
 pip install -r requirements.txt
 python run.py
 ```
 
-Открыть `http://localhost:8000/` — чат заказа.
+Open `http://localhost:8000/` — order chat.
 
-## Структура репозитория
+## Repository structure
 
-- `core/` — ядро агента (из Dagi): agent, state, provider, usage, tools, web
-- `bridge/` — мост заказ→агент (из Fabra + Dagi): runtime, artifacts, events
-- `chat/` — чат-система: API, WebSocket, workspace
-- `orders/` — заказы: API, статусы, пакеты
-- `templates/` — шаблоны агентов (YAML)
-- `frontend/` — чат-UI (HTML + JS)
+- `core/` — agent core (from Dagi): agent, state, provider, usage, tools, web
+- `bridge/` — order → agent bridge (from Fabra + Dagi): runtime, artifacts, events
+- `chat/` — chat system: API, WebSocket, workspace
+- `orders/` — orders: API, statuses, packages
+- `templates/` — agent templates (YAML)
+- `frontend/` — chat UI (HTML + JS)
