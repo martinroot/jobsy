@@ -1,10 +1,10 @@
 <!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Jobsy · Агент заказа</title>
-<link rel="icon" type="image/png" href="/static/fabra-icon-256.png">
+<title>Jobsy · Исполнение заказов через агентов</title>
+<link rel="icon" type="image/png" href="/assets/brand/fabra-icon-256.png">
 <style>
-:root{--bg:#090c11;--panel:#10151d;--line:#242d3b;--text:#f4f7fb;--muted:#7d899c;--accent:#3b82f6;--green:#22c55e}
+:root{--bg:#090c11;--panel:#10151d;--line:#242d3b;--text:#f4f7fb;--muted:#7d899c;--accent:#3b82f6;--green:#22c55e;--amber:#f59e0b}
 *{box-sizing:border-box}html,body{width:100%;height:100%;min-height:0;overflow:hidden}
 body{margin:0;background:var(--bg);color:var(--text);font:13px/1.45 Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
 .top{height:56px;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 14px;gap:11px;background:#090d13}
@@ -15,12 +15,39 @@ body{margin:0;background:var(--bg);color:var(--text);font:13px/1.45 Inter,system
 .identity .sub{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .topright{display:flex;align-items:center;gap:8px}
 .topbtn{padding:0 8px;font-size:11px;border:1px solid var(--line);border-radius:8px;background:#101a27;color:#c9d8ea;cursor:pointer;text-decoration:none}
+.topbtn.primary{background:#3b82f6;border-color:#3b82f6;color:#fff}
 .topbtn.green{background:#14331f;border-color:#22c55e;color:#65e7a1}
-.usage-chip{display:flex;align-items:center;gap:6px;padding:5px 8px;border:1px solid #2b405b;border-radius:9px;background:#101a27;color:#c9d8ea;font-size:9px;white-space:nowrap}
-.usage-chip b{color:#8ff0b4;font-size:10px}
 .layout{display:flex;height:calc(100vh - 56px)}
-.side{width:320px;border-right:1px solid var(--line);background:#0a0f18;overflow:auto;display:flex;flex-direction:column}
+.side{width:340px;border-right:1px solid var(--line);background:#0a0f18;overflow:auto;display:flex;flex-direction:column}
 .main{flex:1;display:flex;flex-direction:column;min-width:0}
+.tabbar{display:flex;border-bottom:1px solid var(--line);padding:0 14px;background:#0a0f18}
+.tab{padding:10px 14px;font-size:12px;font-weight:700;color:var(--muted);border:none;background:transparent;cursor:pointer;border-bottom:2px solid transparent}
+.tab.on{color:#fff;border-bottom-color:#3b82f6}
+.tab:hover{color:#c9d8ea}
+.panel{display:none;flex:1;overflow:auto;padding:14px}
+.panel.on{display:flex;flex-direction:column}
+.order-form{background:#0f1726;border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+.order-form h3{font-size:13px;margin:0 0 10px;color:#fff}
+.field{margin-bottom:10px}
+.field label{display:block;font-size:11px;color:var(--muted);margin-bottom:4px}
+.field input,.field textarea, .field select{width:100%;background:#0b1119;border:1px solid var(--line);border-radius:8px;padding:6px 10px;color:#fff;font:inherit}
+.field textarea{resize:vertical;min-height:80px}
+.btn{padding:7px 14px;border:1px solid var(--line);border-radius:8px;background:#101a27;color:#c9d8ea;font-size:12px;cursor:pointer}
+.btn.primary{background:#3b82f6;border-color:#3b82f6;color:#fff}
+.btn.primary:hover{filter:brightness(1.1)}
+.btn.green{background:#14331f;border-color:#22c55e;color:#65e7a1}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.orders-list{flex:1;overflow-y:auto}
+.order-row{padding:10px 14px;border-bottom:1px solid var(--line);cursor:pointer}
+.order-row:hover{background:#101a27}
+.order-row.on{background:#162033;border-left:3px solid #3b82f6}
+.order-row .name{font-weight:800;font-size:13px;color:#fff}
+.order-row .meta{font-size:11px;color:var(--muted);margin-top:2px}
+.order-row .status{font-size:10px;margin-top:4px;padding:2px 6px;border-radius:6px;background:#0b1119;border:1px solid var(--line);display:inline-block}
+.status-running{color:#3b82f6;border-color:#3b82f6}
+.status-done{color:#22c55e;border-color:#22c55e}
+.status-new{color:#f59e0b;border-color:#f59e0b}
+.status-failed{color:#ef4444;border-color:#ef4444}
 .chatbox{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
 .row{display:flex;gap:10px}
 .row.agent .avatar{order:1}
@@ -33,47 +60,215 @@ body{margin:0;background:var(--bg);color:var(--text);font:13px/1.45 Inter,system
 .tool{display:flex;align-items:center;gap:8px;margin:6px 0;padding:8px 11px;border:1px solid #2c3d58;border-left:3px solid #5b91ff;border-radius:10px;background:#10192a;color:#c9d8ea;font-size:11px}
 .tool.done{border-left-color:#2bb673}
 .actions{display:flex;gap:6px;margin:8px 0}
-.actions button{padding:6px 12px;border:1px solid var(--line);border-radius:8px;background:#101a27;color:#c9d8ea;cursor:pointer;font-size:12px}
+.actions button{padding:6px 12px;border:1px solid var(--line);border-radius:8px;background:#101a27;color:#c9d8ea;font-size:12px;cursor:pointer}
 .actions button.primary{background:#3b82f6;border-color:#3b82f6;color:#fff}
 .composer{border-top:1px solid var(--line);padding:10px 14px;background:#0a0f18}
 .composer-inner{display:flex;gap:8px;align-items:flex-end}
 input.text{flex:1;background:#0f1726;border:1px solid var(--line);border-radius:10px;padding:8px 12px;color:#fff;font:inherit}
 button.send{background:#3b82f6;border:none;border-radius:10px;padding:8px 18px;color:#fff;font-weight:800;cursor:pointer}
-button.send:hover{filter:brightness(1.1)}
+button.send:disabled{opacity:.5;cursor:not-allowed}
 .empty{color:var(--muted);font-size:12px;text-align:center;margin-top:40px}
-.side h3{font-size:12px;color:var(--muted);margin:14px 14px 8px;text-transform:uppercase;letter-spacing:.04em}
-.order-card{border:1px solid var(--line);border-radius:12px;padding:12px;margin:0 14px 14px;background:#0f1726}
-.order-card .name{font-weight:800;font-size:13px}
-.order-card .meta{font-size:11px;color:var(--muted);margin-top:4px}
-.package{margin-top:10px;padding:8px;border:1px solid #2b405b;border-radius:10px;background:#101a27;font-size:11px}
-.metrics{grid-template-columns:repeat(3,minmax(0,1fr));display:grid;gap:8px;margin-top:8px}
+.start-banner{background:linear-gradient(135deg,#1e3a8a,#3b82f6);color:#fff;border-radius:12px;padding:14px;margin-bottom:14px}
+.start-banner h3{margin:0 0 6px;font-size:13px}
+.start-banner p{margin:0;font-size:11px;opacity:.9}
+.metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:8px}
 .metric{background:#0f1726;border:1px solid var(--line);border-radius:8px;padding:8px}
 .metric small{color:var(--muted);font-size:10px;display:block}
 .metric b{font-size:13px;color:#fff}
-hr{border:none;border-top:1px solid var(--line);margin:12px 0}
+.artifact{margin-top:8px;padding:8px;border:1px solid var(--line);border-radius:8px;background:#0f1726;font-size:12px}
+.artifact a{color:#3b82f6;text-decoration:underline}
 .hidden{display:none!important}
+.template-card{border:1px solid var(--line);border-radius:10px;padding:10px;margin-bottom:8px;background:#0f1726;cursor:pointer}
+.template-card.on{border-color:#3b82f6;background:#162033}
+.template-card .name{font-weight:800;font-size:13px;color:#fff}
+.template-card .desc{font-size:11px;color:var(--muted);margin-top:2px}
+.template-card .price{font-size:11px;color:#65e7a1;margin-top:4px}
 </style></head><body>
 <div class="top">
-  <div class="brand"><img src="/static/fabra-icon-256.png" alt=""><div>Jobsy</div></div>
-  <div class="identity"><div class="title" id="title">Jobsy Agent</div><div class="sub" id="sub">Чат заказа · агент с инструментами</div></div>
-  <div class="topright"><a class="topbtn" href="/">К каталогу</a><span class="topbtn green" id="price"></span><div class="usage-chip" id="headerUsage" hidden><b id="headerTokenCount">0 ток.</b> <span id="headerTokenSplit">in 0 · out 0</span> <span id="headerProviderCost">н/д</span></div></div>
+  <div class="brand"><img src="/assets/brand/fabra-icon-256.png" alt=""><div>Jobsy</div></div>
+  <div class="identity"><div class="title" id="pageTitle">Jobsy · Исполнение заказов</div><div class="sub" id="pageSub">Заказ — чат — агент с инструментами</div></div>
+  <div class="topright"><a class="topbtn" href="/">На сайт</a><a class="topbtn primary" id="newOrderBtn">Новый заказ</a><a class="topbtn green" id="refreshBtn">Обновить</a></div>
 </div>
 <div class="layout">
   <div class="side">
-    <div class="order-card" id="orderCard" hidden><div class="name" id="orderName"></div><div class="meta" id="orderMeta"></div></div>
-    <div class="package" id="packageBox" hidden><div id="packageText"></div></div>
-    <div class="metrics" id="usageMetrics"><div class="metric"><small>Время</small><b id="elapsed">—</b></div><div class="metric"><small>Модели</small><b class="usage-models" id="usageModels">—</b></div><div class="metric usage-wide"><small>Сумма</small><b id="usageTotal">—</b></div></div>
-    <h3>Сообщения</h3>
-    <div id="events" style="flex:1;overflow-y:auto;padding:0 14px;font-size:12px;color:var(--muted)"></div>
+    <div class="tabbar"><button class="tab on" data-tab="orders">Заказы</button><button class="tab" data-tab="templates">Шаблоны агентов</button></div>
+    <div class="panel on" id="panelOrders">
+      <div class="order-form"><h3>Создать заказ</h3>
+        <div class="field"><label>Название заказа</label><input id="ordTitle" placeholder="Например: SEO-текст для лендинга"></div>
+        <div class="field"><label>Описание работы (контекст для агента)</label><textarea id="ordDesc" placeholder="Опишите, что нужно сделать…"></textarea></div>
+        <div class="field"><label>Цена (руб)</label><input id="ordPrice" type="number" value="0"></div>
+        <button class="btn primary" id="createOrderBtn">Создать заказ</button>
+      </div>
+      <h3 style="margin:14px 14px 6px">Список заказов</h3>
+      <div class="orders-list" id="ordersList"></div>
+    </div>
+    <div class="panel" id="panelTemplates">
+      <h3 style="margin:14px 14px 6px">Доступные шаблоны агентов</h3>
+      <div id="templatesList"></div>
+    </div>
   </div>
   <div class="main">
-    <div class="chatbox" id="chatbox"></div>
-    <div class="empty" id="emptyChat" hidden>Напишите агенту — он начнёт работу над заказом.</div>
-    <div class="composer">
-      <div class="composer-inner"><input class="text" id="msg" placeholder="Напишите задачу…"><button class="send" id="send">Отправить</button></div>
+    <div class="start-banner hidden" id="startBanner">
+      <h3>Готово к запуску агента</h3>
+      <p>Нажмите «Запустить агента», и сессия получит весь контекст заказа и начнёт работу.</p>
+    </div>
+    <div class="panel on" id="panelChat" hidden>
+      <div class="order-card" id="chatOrderCard" hidden><div class="name" id="chatOrderName"></div><div class="meta" id="chatOrderMeta"></div></div>
+      <div class="metrics" id="usageMetrics"><div class="metric"><small>Время</small><b id="elapsed">—</b></div><div class="metric"><small>Модели</small><b class="usage-models" id="usageModels">—</b></div><div class="metric"><small>Сумма</small><b id="usageTotal">—</b></div></div>
+      <div class="chatbox" id="chatbox"></div>
+      <div class="empty" id="emptyChat">Выберите заказ, чтобы начать чат исполнения.</div>
+      <div class="composer">
+        <div class="composer-inner"><input class="text" id="msg" placeholder="Напишите сообщение агенту…"><button class="send" id="send" disabled>Отправить</button></div>
+        <button class="btn green" id="startAgentBtn" disabled>Запустить агента</button>
+      </div>
     </div>
   </div>
 </div>
-<script src="/static/native-chat.js?v=1"></script>
-<script src="/static/agent-native.js?v=1"></script>
+<script>
+(()=>{
+  const $=(q,r=document)=>r.querySelector(q), $$=(q,r=document)=>Array.from(r.querySelectorAll(q));
+  const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const tm=()=>new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
+  const API='/portal/api';
+
+  /* ---------- state ---------- */
+  let state={orders:[],templates:[],currentOrder:null,currentAgent:null,agentStarted:false};
+  let ws=null, chat=null, seenEvents=new Set(), seenArtifacts=new Set();
+
+  /* ---------- tabs ---------- */
+  $$('.tab').forEach(b=>b.onclick=()=>{
+    $$('.tab').forEach(x=>x.classList.remove('on')); b.classList.add('on');
+    $$('.panel').forEach(p=>p.classList.remove('on')); $('#'+'panel'+b.dataset.tab).classList.add('on');
+  });
+
+  /* ---------- orders ---------- */
+  async function loadOrders(){
+    try{
+      const r=await fetch(API+'/marketplace',{cache:'no-store'});
+      if(r.ok){const j=await r.json(); state.templates=(j.agents||[]).map(a=>({slug:a.slug,name:a.title||a.slug,title:a.title||a.slug,category:a.category||'',description:a.description||'',price_rub:a.price_rub||0,unit:a.unit||'задачу'}));}
+    }catch(_){}
+    const ls=localStorage.getItem('jobsy_orders');
+    if(ls){try{state.orders=JSON.parse(ls);}catch(_){}}
+    renderOrders();
+    renderTemplates();
+  }
+  function saveOrders(){localStorage.setItem('jobsy_orders',JSON.stringify(state.orders));}
+  function renderOrders(){
+    const box=$('#ordersList');
+    if(!state.orders.length){box.innerHTML='<div style="color:var(--muted);padding:8px 14px">Заказов пока нет. Создайте первый.</div>';return;}
+    box.innerHTML=state.orders.map((o,i)=>`<div class="order-row${state.currentOrder===o.number?' on':''}" data-idx="${i}">
+      <div class="name">${esc(o.title||o.slug)}</div>
+      <div class="meta">${esc(o.slug||'')} · ${o.price_rub?o.price_rub+' ₽':'—'}</div>
+      <div class="status status-${o.status||'new'}">${esc(o.status||'new')}</div>
+    </div>`).join('');
+    box.querySelectorAll('.order-row').forEach(el=>{
+      el.onclick=()=>{const idx=el.dataset.idx; selectOrder(state.orders[idx]);};
+    });
+  }
+  function selectOrder(o){
+    state.currentOrder=o.number; state.currentAgent=o.slug; state.agentStarted=false;
+    $$('.order-row').forEach(x=>x.classList.remove('on'));
+    $('#panelOrders').querySelector('[data-idx]').classList.remove('on');
+    const el=$$('#panelOrders .order-row')[state.orders.findIndex(x=>x.number===o.number)];
+    if(el)el.classList.add('on');
+    $('#startBanner').classList.remove('hidden');
+    $('#panelChat').hidden=false; $('#startAgentBtn').disabled=false; $('#send').disabled=false;
+    $('#pageTitle').textContent='Jobsy · '+esc(o.title||o.number);
+    $('#pageSub').textContent='Агент: '+esc(o.slug||'—')+' · заказ '+esc(o.number);
+    $('#chatOrderName').textContent=o.title||o.slug;
+    $('#chatOrderMeta').textContent=o.slug+' · '+esc(o.desc||'')+' · '+ (o.price_rub?o.price_rub+' ₽':'—');
+    $('#chatOrderCard').hidden=false;
+    $('#emptyChat').hidden=true; $('#chatbox').hidden=false;
+    loadChatHistory();
+    if(ws)ws.close(); connectWs();
+  }
+  $('#createOrderBtn').onclick=()=>{
+    const title=$('#ordTitle').value.trim(); const desc=$('#ordDesc').value.trim(); const price=parseFloat($('#ordPrice').value||0);
+    if(!title){alert('Введите название заказа');return;}
+    const number='ORD-'+Math.random().toString(36).slice(2,10);
+    const order={number,title,desc,slug:'seo-site-text',price_rub:price,status:'new',created_at:new Date().toISOString()};
+    state.orders.unshift(order); saveOrders(); renderOrders();
+    $('#ordTitle').value=''; $('#ordDesc').value='';
+    selectOrder(order);
+  };
+  $('#newOrderBtn').onclick=()=>{$$('.tab')[0].click();};
+
+  /* ---------- templates ---------- */
+  function renderTemplates(){
+    const box=$('#templatesList');
+    if(!state.templates.length){box.innerHTML='<div style="color:var(--muted);padding:8px 14px">Шаблоны не загружены.</div>';return;}
+    box.innerHTML=state.templates.map(t=>`<div class="template-card${state.currentAgent===t.slug?' on':''}" data-slug="${t.slug}">
+      <div class="name">${esc(t.name)}</div>
+      <div class="desc">${esc(t.description)}</div>
+      <div class="price">${t.price_rub} ₽ · ${t.unit}</div>
+    </div>`).join('');
+    box.querySelectorAll('.template-card').forEach(el=>{
+      el.onclick=()=>{
+        $$('.template-card').forEach(x=>x.classList.remove('on')); el.classList.add('on');
+        state.currentAgent=el.dataset.slug;
+        if(state.currentOrder){const o=state.orders.find(x=>x.number===state.currentOrder); if(o){o.slug=state.currentAgent; saveOrders(); renderOrders();}}
+      };
+    });
+  }
+
+  /* ---------- chat ---------- */
+  function loadChatHistory(){
+    const box=$('#chatbox'); box.innerHTML='';
+    const lsKey='jobsy_chat_'+state.currentOrder;
+    const ls=localStorage.getItem(lsKey);
+    if(ls){try{const msgs=JSON.parse(ls); msgs.forEach(m=>addMsg(m.role,m.text,m.time));}catch(_){}}
+  }
+  function addMsg(role,text,time){
+    const box=$('#chatbox'); const row=document.createElement('div');
+    row.className='row '+(role==='agent'?'agent':'user');
+    row.innerHTML=`${role==='agent'?'<div class="avatar">F</div>':''}<div class="nc-col"><div class="nc-name">${role==='agent'?'Агент':'Вы'}</div><div class="nc-bubble"><span class="nc-caption">${esc(text).replace(/\n/g,'<br>')}</span><span class="nc-time">${esc(time||tm())}${role==='user'?' ✓':''}</span></div></div>`;
+    box.appendChild(row); box.scrollTop=box.scrollHeight;
+  }
+  function saveMsg(role,text){const lsKey='jobsy_chat_'+state.currentOrder;let msgs=[];try{msgs=JSON.parse(localStorage.getItem(lsKey)||'[]');}catch(_){}msgs.push({role,text,time:tm()});localStorage.setItem(lsKey,JSON.stringify(msgs.slice(-200)));}
+  $('#send').onclick=()=>{const i=$('#msg');const t=i.value.trim();if(!t)return;i.value='';addMsg('user',t);saveMsg('user',t);};
+  $('#msg').onkeypress=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('#send').click();}};
+
+  /* ---------- start agent ---------- */
+  $('#startAgentBtn').onclick=async()=>{
+    const o=state.orders.find(x=>x.number===state.currentOrder);
+    if(!o)return;
+    $('#startAgentBtn').disabled=true; $('#startAgentBtn').textContent='Агент работает…';
+    addMsg('agent','Получаю контекст заказа и запускаю сессию агента…');
+    saveMsg('agent','Получаю контекст заказа и запускаю сессию агента…');
+    try{
+      const ctx={
+        order_number:o.number, title:o.title, slug:o.slug||state.currentAgent,
+        description:o.desc, price_rub:o.price_rub, unit:o.unit||'задачу',
+        tools:['files.list','files.read','web.extract_text','web.extract_links','site.write_file','artifact.publish','document.create_docx'],
+        created_at:o.created_at
+      };
+      const r=await fetch(API+'/jobs/'+encodeURIComponent(o.number)+'/compose/execute',{
+        method:'POST',headers:{'content-type':'application/json'},
+        body:JSON.stringify({goal:o.desc,context:{files:[],agent:o.slug||state.currentAgent}})
+      });
+      if(r.ok){addMsg('agent','Сессия агента запущена. Работа над заказом началась.');saveMsg('agent','Сессия агента запущена. Работа над заказом началась.');state.agentStarted=true;}
+      else{addMsg('agent','Бэкенд недоступен ('+r.status+'). Работа ведётся в локальном чате.');saveMsg('agent','Бэкенд недоступен. Работа ведётся в локальном чате.');}
+    }catch(err){addMsg('agent','Ошибка запуска: '+err.message);saveMsg('agent','Ошибка запуска: '+err.message);}
+  };
+
+  /* ---------- websocket ---------- */
+  function connectWs(){
+    if(!state.currentOrder)return;
+    const proto=location.protocol==='https:'?'wss:':'ws:';
+    try{
+      ws=new WebSocket(proto+'//'+location.host+API+'/jobs/'+encodeURIComponent(state.currentOrder)+'/stream');
+      ws.onopen=()=>{};
+      ws.onmessage=e=>{
+        try{const ev=JSON.parse(e.data); if(ev.event_type==='runtime.text'){const p=String(ev.data?.text||'');if(p){addMsg('agent',p);saveMsg('agent',p);}}
+        }catch(_){}
+      };
+      ws.onclose=()=>{setTimeout(connectWs,2000);};
+    }catch(_){}
+  }
+
+  /* ---------- init ---------- */
+  loadOrders();
+  setInterval(loadOrders,5000);
+})();
+</script>
 </body></html>
